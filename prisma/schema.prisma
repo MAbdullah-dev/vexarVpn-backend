@@ -1,0 +1,180 @@
+// Foundation schema for later VPN control-plane records.
+// Client WireGuard private keys are generated and kept on the device.
+// This schema has no column for a client private key, a server private key,
+// an SSH credential, or a provisioning secret.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountStatus {
+  enabled
+  disabled
+}
+
+enum DevicePlatform {
+  android
+}
+
+enum DeviceStatus {
+  registered
+  revoked
+}
+
+enum ServerStatus {
+  planned
+  disabled
+}
+
+enum SessionState {
+  recorded
+  closed
+}
+
+enum SubscriptionStatus {
+  inactive
+  canceled
+}
+
+model User {
+  id              String        @id @default(uuid()) @db.Uuid
+  email           String        @unique
+  passwordHash    String        @map("password_hash")
+  displayName     String?       @map("display_name")
+  /// Null until a later stage verifies the address. Stage 2 never sets this.
+  emailVerifiedAt DateTime?     @map("email_verified_at")
+  status          AccountStatus @default(enabled)
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+  devices         Device[]
+  refreshTokens   RefreshToken[]
+  subscription    Subscription?
+
+  @@map("users")
+}
+
+/// A registered client device. installId is a client-supplied installation
+/// identifier, not cryptographic proof of the device. wireguardPublicKey is
+/// the only key material this table may hold, and only after a later
+/// provisioning step supplies it.
+model Device {
+  id                 String         @id @default(uuid()) @db.Uuid
+  userId             String         @map("user_id") @db.Uuid
+  platform           DevicePlatform
+  displayName        String?        @map("display_name")
+  installId          String         @map("install_id")
+  appVersion         String?        @map("app_version")
+  wireguardPublicKey String?        @unique @map("wireguard_public_key")
+  status             DeviceStatus   @default(registered)
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+  user               User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions           ConnectionSession[]
+  refreshTokens      RefreshToken[]
+
+  @@unique([userId, installId])
+  @@index([userId])
+  @@map("devices")
+}
+
+/// Opaque refresh tokens are stored as SHA-256 ids. deviceId ties the family
+/// to the installation named in the token claims. Revoking any row revokes
+/// the family, including a successor saved after that revocation.
+model RefreshToken {
+  id              String    @id
+  familyId        String    @map("family_id")
+  userId          String    @map("user_id") @db.Uuid
+  deviceId        String?   @map("device_id") @db.Uuid
+  createdAt       DateTime  @map("created_at")
+  expiresAt       DateTime  @map("expires_at")
+  familyExpiresAt DateTime  @map("family_expires_at")
+  usedAt          DateTime? @map("used_at")
+  revoked         Boolean   @default(false)
+  claims          Json?
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device          Device?   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@index([userId])
+  @@index([familyExpiresAt])
+  @@index([deviceId])
+  @@map("refresh_tokens")
+}
+
+/// Remembers a revoked refresh-token family after the revoking write, so a
+/// successor saved slightly later is stored revoked as well.
+model RevokedRefreshFamily {
+  familyId  String   @id @map("family_id")
+  revokedAt DateTime @default(now()) @map("revoked_at")
+
+  @@map("revoked_refresh_families")
+}
+
+model ServerRegion {
+  id          String      @id @default(uuid()) @db.Uuid
+  code        String      @unique
+  name        String
+  countryCode String      @map("country_code")
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+  servers     VpnServer[]
+
+  @@map("server_regions")
+}
+
+/// Future gateway record. Status starts at planned. The public key is the
+/// server identity peers will use. Private key material stays off this host's
+/// database and off the public API.
+model VpnServer {
+  id                 String       @id @default(uuid()) @db.Uuid
+  regionId           String       @map("region_id") @db.Uuid
+  hostname           String       @unique
+  wireguardPublicKey String       @map("wireguard_public_key")
+  listenPort         Int          @default(51820) @map("listen_port")
+  status             ServerStatus @default(planned)
+  createdAt          DateTime     @default(now()) @map("created_at")
+  updatedAt          DateTime     @updatedAt @map("updated_at")
+  region             ServerRegion @relation(fields: [regionId], references: [id])
+  sessions           ConnectionSession[]
+
+  @@index([regionId])
+  @@index([status])
+  @@map("vpn_servers")
+}
+
+/// A recorded association between a device and a server. Creating a row does
+/// not open a tunnel, assign an address, or change device network settings.
+model ConnectionSession {
+  id        String       @id @default(uuid()) @db.Uuid
+  deviceId  String       @map("device_id") @db.Uuid
+  serverId  String       @map("server_id") @db.Uuid
+  state     SessionState @default(recorded)
+  closedAt  DateTime?    @map("closed_at")
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+  device    Device       @relation(fields: [deviceId], references: [id])
+  server    VpnServer    @relation(fields: [serverId], references: [id])
+
+  @@index([deviceId])
+  @@index([serverId])
+  @@map("connection_sessions")
+}
+
+/// Local subscription record only. Status does not grant Premium access,
+/// start a trial, or contact a billing provider.
+model Subscription {
+  id        String             @id @default(uuid()) @db.Uuid
+  userId    String             @unique @map("user_id") @db.Uuid
+  status    SubscriptionStatus @default(inactive)
+  planCode  String?            @map("plan_code")
+  createdAt DateTime           @default(now()) @map("created_at")
+  updatedAt DateTime           @updatedAt @map("updated_at")
+  user      User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}
